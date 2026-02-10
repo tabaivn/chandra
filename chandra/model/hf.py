@@ -13,30 +13,45 @@ def generate_hf(
     bbox_scale: int = settings.BBOX_SCALE,
     **kwargs,
 ) -> List[GenerationResult]:
+    import torch
     from qwen_vl_utils import process_vision_info
 
     if max_output_tokens is None:
         max_output_tokens = settings.MAX_OUTPUT_TOKENS
 
-    messages = [
-        process_batch_element(item, model.processor, bbox_scale) for item in batch
-    ]
-    text = model.processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    # Device của model (GPU khi dùng device_map="auto")
+    device = next(model.parameters()).device
 
-    image_inputs, _ = process_vision_info(messages)
+    # Mỗi item trong batch là một conversation riêng (1 ảnh + 1 prompt) để model
+    # trả về N output tương ứng N ảnh. Nếu gộp N message thành 1 conversation thì
+    # apply_chat_template + processor chỉ tạo 1 sequence → chỉ 1 output.
+    list_of_messages = [
+        [process_batch_element(item, model.processor, bbox_scale)] for item in batch
+    ]
+    all_texts = [
+        model.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
+        for msgs in list_of_messages
+    ]
+    # process_vision_info (qwen_vl_utils) resize ảnh bằng PIL trên CPU → có thể thành
+    # nút thắt. Có thể cài Pillow-SIMD (pip install pillow-simd) để tăng tốc resize.
+    image_inputs, _ = process_vision_info(list_of_messages)
+
+    # Processor chạy trên CPU (tokenize + tiền xử lý ảnh); output là tensor
     inputs = model.processor(
-        text=text,
+        text=all_texts,
         images=image_inputs,
         padding=True,
         return_tensors="pt",
         padding_side="left",
     )
-    inputs = inputs.to("cuda")
+    # Chuyển toàn bộ input sang cùng device với model (GPU)
+    inputs = inputs.to(device)
 
-    # Inference: Generation of the output
-    generated_ids = model.generate(**inputs, max_new_tokens=max_output_tokens)
+    # Inference trên GPU, không tính gradient
+    with torch.inference_mode():
+        generated_ids = model.generate(**inputs, max_new_tokens=max_output_tokens)
     generated_ids_trimmed = [
         out_ids[len(in_ids) :]
         for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
